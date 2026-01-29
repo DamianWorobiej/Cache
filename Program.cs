@@ -3,7 +3,10 @@ using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddDbContext<WeatherDbContext>(options => options.UseInMemoryDatabase("cacheDb"));
+builder.Services.AddDbContext<WeatherDbContext>(
+    options => options.UseInMemoryDatabase("cacheDb")
+                      .LogTo(x => Console.WriteLine($"[{DateTime.Now}] {x}"))
+                      .EnableSensitiveDataLogging());
 var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
@@ -71,6 +74,49 @@ app.MapGet("/forecastsahead/{days}", async (WeatherDbContext context, int days) 
     }
 
     return forecasts;
+});
+
+app.MapGet("/forecastsaheadselective/{days}", async (WeatherDbContext context, int days) =>
+{
+    const string redisKey = "forecastsSet";
+
+    var redisDb = RedisDbFactory.GetDatabase();
+
+    var output = new List<WeatherForecast>();
+    var missingDates = new List<DateOnly>();
+    foreach (var index in Enumerable.Range(0, days + 1))
+    {
+        var date = DateOnly.FromDateTime(DateTime.Now.AddDays(index));
+        var key = $"{redisKey}:{date}";
+        if (await redisDb.KeyExistsAsync(key))
+        {
+            var cachedValue = await redisDb.StringGetAsync(key);
+            output.Add(JsonSerializer.Deserialize<WeatherForecast>(cachedValue.ToString()));
+
+            continue;
+        }
+
+        missingDates.Add(date);
+    }
+
+    if (missingDates.Count == 0)
+    {
+        return output.OrderBy(x => x.Date);
+    }
+
+    var forecasts = await context.Forecasts
+    .Where(x => missingDates.Contains(x.Date))
+    .ToListAsync();
+
+    foreach (var forecast in forecasts)
+    {
+        var date = forecast.Date.ToString();
+        await redisDb.StringSetAsync($"{redisKey}:{date}", JsonSerializer.Serialize(forecast), new TimeSpan(0, 0, 30));
+    }
+
+    output.AddRange(forecasts);
+
+    return output.OrderBy(x => x.Date);
 });
 
 app.Run();
